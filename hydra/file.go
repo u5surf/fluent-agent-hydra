@@ -2,9 +2,12 @@ package hydra
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fujiwara/fluent-agent-hydra/fluent"
@@ -21,6 +24,8 @@ var (
 	ReadBufferSize = 64 * 1024
 )
 
+var m *sync.Mutex
+
 type File struct {
 	*os.File
 	Path           string
@@ -34,11 +39,41 @@ type File struct {
 	Format         FileFormat
 	RecordModifier *RecordModifier
 	Regexp         *Regexp
+	Inode          uint64
+	Pf             *os.File
+}
+
+func (f *File) ReadPosfile() (uint64, int64) {
+	var Inode uint64
+	var Position int64
+	m.Lock()
+	fmt.Fscanf(f.Pf, "%d\t%d", &Inode, &Position)
+	m.Unlock()
+	return Inode, Position
+}
+
+func (f *File) WritePosfile(inode uint64, position int64) error {
+	m.Lock()
+	f.Pf.Seek(int64(0), os.SEEK_SET)
+	_, err := fmt.Fprintf(f.Pf, "%d\t%d", inode, position)
+	m.Unlock()
+	return err
 }
 
 func openFile(path string, startPos int64) (*File, error) {
+	m = new(sync.Mutex)
 	f, err := os.Open(path)
 	if err != nil {
+		return nil, err
+	}
+	pf, err := os.OpenFile(path+".pos", os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, err
+	}
+	var st syscall.Stat_t
+	err = syscall.Stat(path, &st)
+	if err != nil {
+		log.Println(err)
 		return nil, err
 	}
 	stat, err := f.Stat()
@@ -59,6 +94,15 @@ func openFile(path string, startPos int64) (*File, error) {
 		FormatNone,
 		nil,
 		nil,
+		st.Ino,
+		pf,
+	}
+	pfIno, pfPos := file.ReadPosfile()
+	if pfIno != st.Ino {
+		file.WritePosfile(st.Ino, int64(0))
+		startPos = int64(0)
+	} else if startPos != pfPos {
+		startPos = pfPos
 	}
 
 	if startPos == SEEK_TAIL {
@@ -70,7 +114,8 @@ func openFile(path string, startPos int64) (*File, error) {
 		pos, _ := file.Seek(startPos, os.SEEK_SET)
 		file.Position = pos
 	}
-	log.Println("[info]", file.Path, "Seeked to", file.Position)
+	log.Println("[info]", file.Path, "Seeked To", file.Position)
+	log.Println("[info]", file.Path, "Inode", file.Inode)
 	return file, nil
 }
 
@@ -82,7 +127,7 @@ func (f *File) restrict() error {
 		return err
 	}
 	if size := f.lastStat.Size(); size < f.Position {
-		pos, _ := f.Seek(int64(0), os.SEEK_SET)
+	  pos, _ := f.Seek(size, os.SEEK_SET)
 		f.Position = pos
 		log.Println("[info]", f.Path, "was truncated. Seeked to", pos)
 	}
@@ -128,6 +173,7 @@ func (f *File) tailAndSend(messageCh chan *fluent.FluentRecordSet, monitorCh cha
 }
 
 func (f *File) UpdateStat() *FileStat {
+	f.WritePosfile(f.Inode, f.Position)
 	f.FileStat.File = f.Path
 	f.FileStat.Position = f.Position
 	f.FileStat.Tag = f.Tag
